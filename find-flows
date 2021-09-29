@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+#
+# FRESNEL: fresnel_dista
+#
+# Copyright © 2019-2021 - Raytheon BBN Technologies Corp.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# DISTRIBUTION STATEMENT A.
+# Approved for public release: distribution unlimited.
+#
+# This material is based upon work supported by the Defense Advanced
+# Research Projects Agency under Contract No. W911NF-19-C-0042.
+# Any opinions, findings and conclusions or recommendations expressed
+# in this material are those of the author(s) and do not necessarily
+# reflect the views of the Defense Advanced Research Project Agency.
+#
+# FRESNEL: end
+
+"""
+Utility to find "flows" in pcap files.  A flow is defined as a
+sequence of packets that share the same five-tuple and have some
+plausible evidence of being an actual connection, instead of
+IBR or a more sophisticated attempt at forgery.  Since in some
+cases we only see one direction of the flow, the best we can do
+is heuristic tests, because it's possible to convincingly spoof
+one side of a connection.
+
+We also include heuristics for filtering out five-tuples that
+look suspicious (i.e. neither of the ports looks like an
+ephemeral port).
+
+For simplicity, this is a two-pass process: first we scan through
+the input to find all the plausible five-tuples, and then we
+re-open the input and look for anything that matches any of those
+plausible five-tuples.
+
+This approach is a little slow, and also vulnerable to replay,
+but it seems adequate for the datasets that we're using now,
+which are already filtered to remove all packets that don't
+match specific protocol/port combinations, and thereby remove
+the vast majority of the packets from consideration.  (If we
+had to do this for all the tcp:443 traffic in the CAIDA traces,
+for example, it might be worth the investment to do something
+more clever)
+"""
+
+import struct
+import sys
+
+from datetime import datetime
+from argparse import ArgumentParser
+
+import dpkt
+import dpkt.ip
+
+
+def normalize_five_tuple(
+        proto, src, dst, sport, dport):
+
+    if dport < sport:
+        return (proto, dst, src, dport, sport)
+    elif dport > sport:
+        return (proto, src, dst, sport, dport)
+    elif dst < src:
+        # Shouldn't get here, but need to do something
+        # if we do
+        return (proto, src, dst, sport, dport)
+    elif src < dst:
+        return (proto, dst, src, dport, sport)
+    else:
+        # REALLY shouldn't get here, but need to do
+        # something if we do
+        return (proto, dst, src, dport, sport)
+
+
+def pkt2five_tuple(pkt_eth):
+
+    if pkt_eth.type != dpkt.ethernet.ETH_TYPE_IP:
+        return None
+
+    pkt_ip = pkt_eth.data
+
+    try:
+        ip_proto = pkt_ip.p
+        ip_src, = struct.unpack('!I', pkt_ip.src)
+        ip_dst, = struct.unpack('!I', pkt_ip.dst)
+
+        if ip_proto == dpkt.ip.IP_PROTO_TCP:
+            body = pkt_ip.tcp
+            sport = body.sport
+            dport = body.dport
+        elif ip_proto == dpkt.ip.IP_PROTO_UDP:
+            body = pkt_ip.udp
+            sport = body.sport
+            dport = body.dport
+        else:
+            return None
+
+    except BaseException as exc:
+        #sys.stderr.write(
+        #        'bad pkt: type %d len %d: %s\n' %
+        #        (ip_proto, pkt_ip.len, str(exc)))
+
+        # If anything fails, drop the packet
+        return None
+
+    return normalize_five_tuple(ip_proto, ip_src, ip_dst, sport, dport)
+
+
+class PcapFilterFiveTuple(object):
+    """
+    Wrapper for the pcap feature extractor
+    """
+
+    def __init__(self, five_tuples):
+
+        self.five_tuples = five_tuples
+
+    def test_pkt(self, pkt_eth, pkt_ts):
+        """
+        Return True if the packet matches any of the
+        five_tuples, False otherwise.
+
+        Note that any protocols other than TCP and UDP
+        are immediately rejected.  We don't even attempt
+        to do something rational about them.
+
+        Returns None if anything goes wrong during the
+        parsing of the packet -- which shouldn't happen
+        for well-formed input...
+        """
+
+        five_tuple = pkt2five_tuple(pkt_eth)
+        if not five_tuple:
+            return False
+        else:
+            return five_tuple in self.five_tuples
+
+    def process(self, in_file, out_file):
+        """
+        Process a single input stream, writing the results
+        to the output stream.
+        """
+
+        try:
+            pcap_fin = dpkt.pcap.Reader(in_file)
+            pcap_fout = dpkt.pcap.Writer(out_file)
+        except BaseException as exc:
+            # Just die
+            print('ERROR: %s' % str(exc))
+            return None
+
+        for timestamp, packet in pcap_fin:
+            try:
+                pkt_eth = dpkt.ethernet.Ethernet(packet)
+            except BaseException as exc:
+                pass
+
+            if self.test_pkt(pkt_eth, timestamp):
+                missing = pkt_eth.data.len - len(pkt_eth.data)
+                if missing > 0:
+                    # Create a fake data segment with 'x' characters
+                    pkt_eth.data.data.data = b'x' * missing
+
+                    # Force the IP/TCP/UDP checksums to be recalculated
+                    pkt_eth.data.data.sum = 0
+                    pkt_eth.data.sum = 0
+                    pkt_eth.pack()
+
+                pcap_fout.writepkt(pkt_eth, timestamp)
+
+        return True
+
+
+class PcapFindFlows(object):
+    """
+    Wrapper for the pcap feature extractor
+    """
+
+    def __init__(self, five_tuples):
+
+        self.five_tuples = five_tuples
+        self.ft2count = dict()
+        self.ft2data = dict()
+
+    def test_pkt(self, pkt_eth, pkt_ts):
+        """
+        """
+
+        five_tuple = pkt2five_tuple(pkt_eth)
+        if not five_tuple:
+            return False
+
+        # If the five_tuple is already believed to be good,
+        # then there's no need to check again
+        #
+        if five_tuple in self.five_tuples:
+            return True
+
+        (proto, svr, cli, svr_port, cli_port) = five_tuple
+
+        # this is a heuristic...  Not guaranteed to work
+        if cli_port < 32000:
+            return False
+
+        if proto == 6:
+            if five_tuple in self.ft2count:
+                self.ft2count[five_tuple] += 1
+            else:
+                self.ft2count[five_tuple] = 1
+
+            if self.ft2count[five_tuple] > 20:
+                self.five_tuples.add(five_tuple)
+
+            ip = pkt_eth.data
+            ip_hdr_len = ip.__hdr_len__ + len(ip.opts)
+            tcp = ip.tcp
+            tcp_hdr_len = tcp.__hdr_len__ + len(tcp.opts)
+            ip_len = pkt_eth.data.len
+            seglen = ip_len - (ip_hdr_len + tcp_hdr_len)
+
+            if seglen > 0:
+                if five_tuple in self.ft2data:
+                    self.ft2data[five_tuple] += 1
+                else:
+                    self.ft2data[five_tuple] = 1
+
+                if self.ft2data[five_tuple] > 15:
+                    self.five_tuples.add(five_tuple)
+
+        elif proto == 17:
+            if five_tuple in self.ft2count:
+                self.ft2count[five_tuple] += 1
+            else:
+                self.ft2count[five_tuple] = 1
+
+            if self.ft2count[five_tuple] > 8:
+                self.five_tuples.add(five_tuple)
+
+        # print('%s svr %s cli %s port %s eph %s' % five_tuple)
+
+    def process(self, in_file):
+        """
+        Process a single input stream, writing the results
+        to the output stream.
+        """
+
+        pcap_fin = dpkt.pcap.Reader(in_file)
+
+        for timestamp, packet in pcap_fin:
+            try:
+                pkt_eth = dpkt.ethernet.Ethernet(packet)
+            except BaseException as exc:
+                pass
+
+            self.test_pkt(pkt_eth, timestamp)
+
+
+def parse_args(argv):
+    """
+    Parse the commandline
+    """
+
+    parser = ArgumentParser()
+
+    parser.add_argument(
+            'in_fname',
+            help='Input pcap file')
+
+    parser.add_argument(
+            'out_fname',
+            help='Output pcap file')
+
+    args = parser.parse_args(argv)
+
+    if not args.in_fname:
+        print('ERROR: %s: input filename is required' % argv[0])
+        return None
+
+    if not args.out_fname:
+        print('ERROR: %s: output filename is required' % argv[0])
+        return None
+
+    return args
+
+
+def main(argv):
+    """
+    Main of pcap_addr
+    """
+
+    args = parse_args(argv[1:])
+    if not args:
+        return 1
+
+    good_flows = set()
+    finder = PcapFindFlows(good_flows)
+
+    try:
+        fin = open(args.in_fname, 'rb')
+    except BaseException as exc:
+        print('ERROR: %s' % str(exc))
+        return 1
+
+    finder.process(fin)
+    fin.close()
+
+    try:
+        fin = open(args.in_fname, 'rb')
+        fout = open(args.out_fname, 'wb')
+    except BaseException as exc:
+        print('ERROR: %s' % str(exc))
+        return 1
+
+    pruner = PcapFilterFiveTuple(good_flows)
+    pruner.process(fin, fout)
+
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
